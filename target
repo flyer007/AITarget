@@ -1,0 +1,288 @@
+/*
+  ESP32-C3 0.42" OLED Target
+  - Mesh to Base
+  - ADXL345 on I2C (SDA=5, SCL=6)  <-- change to 8/9 if needed
+  - Piezo on GPIO0
+  - RGB on 3,4,7 via LEDC
+  - Base sends:
+      {"t":"CFG","hits":2,"active_s":5,"rand_act":0}
+    where:
+      hits      = hits to neutralize
+      active_s  = DELAY (seconds) after START before target becomes hot
+      rand_act  = 1 -> ignore active_s, delay is random 3..8 s
+  - After it becomes hot (RED), it stays hot until hitsToNeutralize is reached
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <painlessMesh.h>
+#include <Adafruit_ADXL345_U.h>
+
+// ========= MESH SETTINGS =========
+#define MESH_PREFIX   "steelTargetsMesh"
+#define MESH_PASSWORD "123456789"
+#define MESH_PORT     5555
+
+painlessMesh mesh;
+
+// ========= PINS =========
+#define I2C_SDA   5     // change to 8 if your board uses 8/9
+#define I2C_SCL   6     // change to 9 if your board uses 8/9
+#define PIEZO_PIN 0
+#define LED_R_PIN 3
+#define LED_G_PIN 4
+#define LED_B_PIN 7
+
+// ========= LEDC =========
+#define LEDC_FREQ 5000
+#define LEDC_RES  8
+#define LEDC_CH_R 0
+#define LEDC_CH_G 1
+#define LEDC_CH_B 2
+
+// ========= SENSORS =========
+Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);
+
+// ========= STATE =========
+uint8_t  targetID          = 1;
+uint8_t  hitsToNeutralize  = 2;
+
+// from base:
+uint16_t activationDelaySeconds = 5;   // how long to WAIT after START
+bool     randomDelay            = false;
+
+// runtime:
+bool     active          = false;      // true = target is HOT (can be hit)
+bool     pendingActivate = false;      // true = we’re waiting for delay
+uint32_t activateAtMs    = 0;          // millis when we will become active
+uint8_t  hitCount        = 0;
+bool     dualSense       = false;
+
+uint32_t activatedMs     = 0;          // for reporting rt in hit message
+
+// ========= FORWARD =========
+void applyConfigFromMsg(const String &msg);
+void beginDelayedActivation();
+void becomeActive();
+void stopSession();
+void checkForHit();
+void sendHit(uint8_t hitNum, int16_t ax, int16_t ay, int16_t az);
+void setRGB(uint8_t r, uint8_t g, uint8_t b);
+bool detectHitAccel(float mag, float threshold);
+
+// ========= MESH CALLBACKS =========
+void receivedCallback(uint32_t from, String &msg) {
+  Serial.printf("RX from %u: %s\n", from, msg.c_str());
+
+  if (msg.indexOf("\"t\":\"CFG\"") != -1) {
+    applyConfigFromMsg(msg);
+  } else if (msg.indexOf("\"t\":\"START\"") != -1) {
+    // start means: begin waiting for activation
+    beginDelayedActivation();
+  } else if (msg.indexOf("\"t\":\"STOP\"") != -1) {
+    stopSession();
+  }
+}
+
+void newConnectionCallback(uint32_t nodeId) {
+  Serial.printf("New node: %u\n", nodeId);
+}
+
+// ========= SETUP =========
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  WiFi.setSleep(false);
+
+  // I2C
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  // ADXL345
+  if (!accel.begin()) {
+    Serial.println("ADXL345 not found, continuing...");
+  } else {
+    accel.setRange(ADXL345_RANGE_4_G);
+  }
+
+  // piezo
+  pinMode(PIEZO_PIN, INPUT);
+
+  // LEDC
+  ledcSetup(LEDC_CH_R, LEDC_FREQ, LEDC_RES);
+  ledcSetup(LEDC_CH_G, LEDC_FREQ, LEDC_RES);
+  ledcSetup(LEDC_CH_B, LEDC_FREQ, LEDC_RES);
+  ledcAttachPin(LED_R_PIN, LEDC_CH_R);
+  ledcAttachPin(LED_G_PIN, LEDC_CH_G);
+  ledcAttachPin(LED_B_PIN, LEDC_CH_B);
+  setRGB(0, 0, 255);  // idle blue
+
+  // mesh
+  mesh.setDebugMsgTypes(ERROR | STARTUP);
+  mesh.init(MESH_PREFIX, MESH_PASSWORD, MESH_PORT);
+  mesh.setContainsRoot(true);
+  mesh.onReceive(&receivedCallback);
+  mesh.onNewConnection(&newConnectionCallback);
+
+  Serial.println("C3 target ready (delay-before-hot).");
+}
+
+void loop() {
+  mesh.update();
+
+  // handle delayed activation
+  if (pendingActivate && millis() >= activateAtMs) {
+    becomeActive();
+  }
+
+  // when active, check for hits
+  if (active) {
+    checkForHit();
+  }
+}
+
+// ========= IMPLEMENTATION =========
+
+void applyConfigFromMsg(const String &msg) {
+  int pos;
+
+  if ((pos = msg.indexOf("\"hits\":")) != -1) {
+    hitsToNeutralize = msg.substring(pos + 7).toInt();
+  }
+
+  if ((pos = msg.indexOf("\"active_s\":")) != -1) {
+    activationDelaySeconds = msg.substring(pos + 12).toInt();
+  }
+
+  if ((pos = msg.indexOf("\"rand_act\":")) != -1) {
+    randomDelay = msg.substring(pos + 12, pos + 13).toInt();
+  }
+
+  if ((pos = msg.indexOf("\"dual\":")) != -1) {
+    dualSense = msg.substring(pos + 8, pos + 9).toInt();
+  }
+
+  Serial.printf("CFG: hits=%u delay_s=%u rand_delay=%d dual=%d\n",
+                hitsToNeutralize, activationDelaySeconds, randomDelay, dualSense);
+}
+
+void beginDelayedActivation() {
+  hitCount = 0;
+  active = false;
+
+  // choose delay
+  uint16_t delaySec;
+  if (randomDelay) {
+    delaySec = random(3, 9);  // 3..8 seconds
+  } else {
+    delaySec = activationDelaySeconds;
+  }
+
+  pendingActivate = true;
+  activateAtMs = millis() + (uint32_t)delaySec * 1000UL;
+
+  // show "waiting" color (yellow-ish)
+  setRGB(255, 120, 0);
+
+  Serial.printf("START received: will activate in %u s\n", delaySec);
+}
+
+void becomeActive() {
+  pendingActivate = false;
+  active = true;
+  activatedMs = millis();
+  setRGB(255, 0, 0); // RED = target HOT
+  Serial.println("Target is now ACTIVE (hot).");
+}
+
+void stopSession() {
+  pendingActivate = false;
+  active = false;
+  setRGB(0, 0, 255);
+  Serial.println("Session stopped (to idle).");
+}
+
+void checkForHit() {
+  // read accel
+  sensors_event_t event;
+  bool accelOK = accel.getEvent(&event);
+  float mag = 0;
+  if (accelOK) {
+    mag = sqrt(event.acceleration.x * event.acceleration.x +
+               event.acceleration.y * event.acceleration.y +
+               event.acceleration.z * event.acceleration.z);
+  }
+
+  // read piezo
+  int piezoVal = analogRead(PIEZO_PIN);
+
+  const float accelThreshold = 2.5f;
+  const int   piezoThreshold = 400;
+
+  bool hit = false;
+
+  if (!dualSense) {
+    if (accelOK && detectHitAccel(mag, accelThreshold)) hit = true;
+    if (piezoVal > piezoThreshold) hit = true;
+  } else {
+    bool accelHit = accelOK && detectHitAccel(mag, accelThreshold);
+    bool piezoHit = piezoVal > piezoThreshold;
+    if (accelHit && piezoHit) hit = true;
+  }
+
+  if (hit) {
+    hitCount++;
+
+    int16_t ax = accelOK ? (int16_t)(event.acceleration.x * 100) : 0;
+    int16_t ay = accelOK ? (int16_t)(event.acceleration.y * 100) : 0;
+    int16_t az = accelOK ? (int16_t)(event.acceleration.z * 100) : 0;
+
+    // rt = how long after we became hot
+    uint32_t rtMs = millis() - activatedMs;
+    String msg = "{\"t\":\"H\",\"id\":";
+    msg += targetID;
+    msg += ",\"h\":";
+    msg += hitCount;
+    msg += ",\"rt\":";
+    msg += rtMs;
+    msg += ",\"ax\":";
+    msg += ax;
+    msg += ",\"ay\":";
+    msg += ay;
+    msg += ",\"az\":";
+    msg += az;
+    msg += "}";
+
+    mesh.sendBroadcast(msg);
+    Serial.println("Sent hit: " + msg);
+
+    // flash to confirm hit
+    setRGB(255, 255, 0);
+    delay(80);
+    setRGB(255, 0, 0); // stay red, still active
+
+    if (hitCount >= hitsToNeutralize) {
+      // neutralized
+      setRGB(0, 255, 0);  // green
+      delay(300);
+      stopSession();
+    }
+  }
+}
+
+bool detectHitAccel(float mag, float threshold) {
+  static float lastMag = 0;
+  bool hit = false;
+  if (fabs(mag - lastMag) > threshold) {
+    hit = true;
+  }
+  lastMag = mag;
+  return hit;
+}
+
+void setRGB(uint8_t r, uint8_t g, uint8_t b) {
+  ledcWrite(LEDC_CH_R, r);
+  ledcWrite(LEDC_CH_G, g);
+  ledcWrite(LEDC_CH_B, b);
+}
